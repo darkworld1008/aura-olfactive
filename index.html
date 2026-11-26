@@ -365,6 +365,12 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.2)}
 .flacon canvas{left:50%;top:0;height:100%;aspect-ratio:540/960;translate:-50% 0;opacity:0;transition:opacity .5s ease}
 .flacon.spin canvas{opacity:1}
 .flacon.spin img{opacity:0;transition-delay:.5s}
+.flacon.spin{touch-action:pan-y;cursor:grab;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+.flacon.spin.grab{cursor:grabbing}
+.turn-hint{position:absolute;left:50%;bottom:.5%;translate:-50% 0;z-index:3;display:inline-flex;align-items:center;gap:10px;padding:9px 15px;border-radius:99px;pointer-events:none;white-space:nowrap;
+  font:600 10px/1 var(--sans);letter-spacing:.2em;text-transform:uppercase;color:var(--ink-2);opacity:0;transition:opacity .6s ease}
+.turn-hint .ic{width:13px;height:13px}.turn-hint .ic:first-child{scale:-1 1}
+.flacon.spin:not(.touched) .turn-hint{opacity:1;transition-delay:.8s}
 
 /* arabic collection */
 .colwrap{position:relative}
@@ -1549,69 +1555,112 @@ const lean = (() => {
   return { tick };
 })();
 
-/* ───────── Aura No. 1 — the flacon turns once as it arrives ─────────
-   96 keyed frames in rot/ are painted on a canvas over the still photo (which stays as the fallback).
-   The spin runs while the bottle travels up to the middle of the screen, then it rests facing you.
-   Frames are fetched as blobs and decoded off the main thread in a small window around the current one. */
+/* ───────── Aura No. 1 — turn the flacon by hand ─────────
+   96 keyed frames in rot/ (one full turn) are painted on a canvas over the still photo, which stays as the fallback.
+   Drag or swipe sideways on the bottle (or two-finger swipe, shift+wheel, ← →) to turn it; it keeps its momentum.
+   Page scrolling never turns it. Frames are fetched as blobs and decoded off the main thread in a window around the current one. */
 const spin = (() => {
   const box = $('.flacon'), host = box && $('.fl-in', box);
-  if (!box || !host || reduce || !('IntersectionObserver' in window) || typeof createImageBitmap !== 'function' || !window.fetch) return null;
+  if (!box || !host || !('IntersectionObserver' in window) || typeof createImageBitmap !== 'function' || !window.fetch) return null;
   if (navigator.connection && navigator.connection.saveData) return null;
-  const NF = 96, FW = 540, FH = 960, R = 10;
+  const NF = 96, FW = 540, FH = 960, R = 12;
   const cv = document.createElement('canvas'); cv.width = FW; cv.height = FH; cv.setAttribute('aria-hidden', 'true');
   const cx = cv.getContext('2d', { alpha: false });
   if (!cx) return null;
   host.appendChild(cv);
   const bl = new Array(NF), bm = new Array(NF), pend = new Set();
-  let n = 0, wnt = -1, ctr = 0, last = null, cur = 0, top = 0, hh = 1, vh = innerHeight, lastSH = 0, ready = false, shownCls = false, go = false, k = 0;
+  let n = 0, wnt = -1, ctr = 0, last = null, pos = 0, vel = 0, tgt = null, drag = false, pid = -1, lx = 0, lt = 0, moved = 0;
+  let ready = false, live = false, go = false, k = 0;
+  const mod = i => ((i % NF) + NF) % NF, cd = (a, b) => { const d = Math.abs(a - b); return Math.min(d, NF - d); };
+  const fpp = () => NF / (1.1 * (box.offsetWidth || 340));        /* frames per pixel: one full turn per ~1.1 bottle-widths of travel */
   const ord = [], seen = new Set();
   const add = i => { if (!seen.has(i)) { seen.add(i); ord.push(i); } };
   add(0); add(NF - 1);
   [8, 4, 2, 1].forEach(s => { for (let i = 0; i < NF; i += s) add(i); });   /* coarse first, then fill in */
-  const absTop = el => { let y = 0; for (let e = el; e; e = e.offsetParent) y += e.offsetTop; return y; };
-  const meas = () => { top = absTop(box); hh = box.offsetHeight || 1; vh = innerHeight; lastSH = document.documentElement.scrollHeight; };
-  const target = y => sstep(.06, .5, (y + vh - top) / (vh + hh));
+  const touched = () => box.classList.add('touched');
   /* decode the frames around c; drop the ones far away so memory stays small */
   const warm = c => {
     ctr = c;
-    for (let d = 0; d <= R; d++) [c + d, c - d].forEach(i => {
-      if (i < 0 || i >= NF || bm[i] || pend.has(i) || !bl[i]) return;
+    for (let d = 0; d <= R; d++) [c + d, c - d].forEach(j => {
+      const i = mod(j);
+      if (bm[i] || pend.has(i) || !bl[i]) return;
       pend.add(i);
-      createImageBitmap(bl[i]).then(b => { pend.delete(i); if (Math.abs(i - ctr) > R + 4) b.close(); else bm[i] = b; }, () => pend.delete(i));
+      createImageBitmap(bl[i]).then(b => { pend.delete(i); if (cd(i, ctr) > R + 4) b.close(); else bm[i] = b; }, () => pend.delete(i));
     });
-    for (let i = 0; i < NF; i++) if (bm[i] && Math.abs(i - c) > R + 4) { bm[i].close(); bm[i] = null; }
+    for (let i = 0; i < NF; i++) if (bm[i] && cd(i, c) > R + 4) { bm[i].close(); bm[i] = null; }
   };
   const pick = w => {
     if (bm[w]) return bm[w];
-    for (let d = 1; d < NF; d++) { if (w - d >= 0 && bm[w - d]) return bm[w - d]; if (w + d < NF && bm[w + d]) return bm[w + d]; }
+    for (let d = 1; d <= NF / 2; d++) { if (bm[mod(w - d)]) return bm[mod(w - d)]; if (bm[mod(w + d)]) return bm[mod(w + d)]; }
     return null;
   };
   const paint = () => {
-    const w = Math.round(cur * (NF - 1));
+    const w = mod(Math.round(pos));
     if (w !== wnt) { wnt = w; warm(w); }
     const s = pick(w);
     if (!s || s === last) return;
     last = s; cx.drawImage(s, 0, 0);
-    if (!shownCls) { shownCls = true; box.classList.add('spin'); }
+    if (!live) goLive();
   };
+  function goLive() {
+    live = true;
+    box.classList.add('spin');
+    box.setAttribute('tabindex', '0'); box.setAttribute('role', 'group'); box.setAttribute('aria-roledescription', '360° viewer');
+    box.setAttribute('aria-label', 'Aura No. 1 flacon. Drag sideways or use the left and right arrow keys to turn it.');
+    box.dataset.cursorLabel = 'Drag';
+    box.insertAdjacentHTML('beforeend', '<span class="turn-hint glass" aria-hidden="true"><svg class="ic"><use href="#i-arrow"/></svg>' + (matchMedia('(pointer:coarse)').matches ? 'Swipe to turn' : 'Drag to turn') + '<svg class="ic"><use href="#i-arrow"/></svg></span>');
+  }
+  /* ── input ── */
+  box.addEventListener('pointerdown', e => {
+    if (!live || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    drag = true; pid = e.pointerId; lx = e.clientX; lt = e.timeStamp; vel = 0; tgt = null; moved = 0;
+    try { box.setPointerCapture(pid); } catch (_) {}
+    box.classList.add('grab');
+  });
+  box.addEventListener('pointermove', e => {
+    if (!drag || e.pointerId !== pid) return;
+    const dx = e.clientX - lx, dm = Math.max(e.timeStamp - lt, 1), f = dx * fpp();
+    lx = e.clientX; lt = e.timeStamp; moved += Math.abs(dx);
+    pos += f; vel = vel * .55 + (f / dm * 1000) * .45;
+    if (moved > 4) touched();
+  });
+  const end = e => {
+    if (!drag || e.pointerId !== pid) return;
+    drag = false; pid = -1; box.classList.remove('grab');
+    if (e.timeStamp - lt > 90 || reduce) vel = 0;
+  };
+  ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t => box.addEventListener(t, end));
+  box.addEventListener('dragstart', e => e.preventDefault());
+  box.addEventListener('wheel', e => {            /* sideways trackpad swipe, or shift + wheel; plain vertical wheel keeps scrolling the page */
+    if (!live || e.ctrlKey) return;
+    let dx = e.deltaX;
+    if (e.shiftKey && !dx) dx = e.deltaY; else if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+    e.preventDefault(); e.stopPropagation();
+    dx *= e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? innerHeight : 1;
+    pos -= dx * fpp() * 1.4; vel = 0; tgt = null; touched();
+  }, { passive: false });
+  box.addEventListener('keydown', e => {
+    if (!live || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+    e.preventDefault(); e.stopPropagation(); touched();
+    const d = (e.key === 'ArrowRight' ? 1 : -1) * 6;
+    if (reduce) pos += d; else tgt = (tgt === null ? pos : tgt) + d;
+  });
+  /* ── loading: only when the section is near ── */
   const pull = () => {
     if (k >= ord.length) return;
     const i = ord[k++];
     fetch('rot/r' + String(i + 1).padStart(3, '0') + '.webp')
       .then(r => r.ok ? r.blob() : Promise.reject())
-      .then(b => { bl[i] = b; n++; wnt = -1; if (!ready && n >= 26) { ready = true; meas(); cur = target(scrollY); } pull(); }, pull);
+      .then(b => { bl[i] = b; n++; wnt = -1; if (!ready && n >= 26) ready = true; pull(); }, pull);
   };
   const start = () => { if (go) return; go = true; for (let w = 0; w < 4; w++) pull(); };
-  meas();
-  addEventListener('resize', meas); addEventListener('load', meas);
   new IntersectionObserver((es, io) => { if (es.some(e => e.isIntersecting)) { io.disconnect(); start(); } }, { rootMargin: '1800px 0px' }).observe(box);
-  function tick(dt, y) {
+  function tick(dt) {
     if (!ready) return;
-    if (document.documentElement.scrollHeight !== lastSH) meas();
-    const t = (y + vh - top) / (vh + hh);          /* 0: bottle enters at the bottom of the screen, 1: it has left at the top */
-    if (t < -.15 || t > 1.15) { cur = t > 1 ? 1 : 0; if (!shownCls) paint(); return; }
-    const tg = target(y);
-    cur = Math.abs(tg - cur) < 5e-4 ? tg : cur + (tg - cur) * (1 - Math.exp(-dt * 10));
+    if (!drag) {
+      if (tgt !== null) { pos += (tgt - pos) * (1 - Math.exp(-dt * 12)); if (Math.abs(tgt - pos) < .05) { pos = tgt; tgt = null; } }
+      else if (vel) { pos += vel * dt; vel *= Math.exp(-dt * 3.4); if (Math.abs(vel) < .4) vel = 0; }
+    }
     paint();
   }
   return { tick };
