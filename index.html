@@ -359,7 +359,12 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.2)}
 .assure b{display:block;font:600 10.5px/1.3 var(--sans);letter-spacing:.14em;text-transform:uppercase}
 .assure span{display:block;font-size:12px;color:var(--ink-3);line-height:1.35;margin-top:3px}
 .flacon{position:relative;width:100%;max-width:480px;aspect-ratio:480/630;margin:0 auto;overflow:clip}
-.flacon img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none;-webkit-user-drag:none;animation:float 9s ease-in-out infinite}
+.fl-in{position:absolute;inset:0;animation:float 9s ease-in-out infinite}
+.flacon img,.flacon canvas{position:absolute;pointer-events:none;user-select:none;-webkit-user-drag:none}
+.flacon img{inset:0;width:100%;height:100%;object-fit:contain;transition:opacity .4s ease}
+.flacon canvas{left:50%;top:0;height:100%;aspect-ratio:540/960;translate:-50% 0;opacity:0;transition:opacity .5s ease}
+.flacon.spin canvas{opacity:1}
+.flacon.spin img{opacity:0;transition-delay:.5s}
 
 /* arabic collection */
 .colwrap{position:relative}
@@ -703,7 +708,7 @@ html.compact .nav-wrap{top:max(10px,env(safe-area-inset-top,0px))}
         </div>
         <p class="fine">Free insured worldwide courier. Unopened returns within 30 days via the discovery vial.</p>
       </div>
-      <div class="flacon rv" style="--d:.15s" role="img" aria-label="Aura No. 1 flacon"><img src="aura-no1.webp" alt="" width="760" height="998" loading="lazy" decoding="async" draggable="false"></div>
+      <div class="flacon rv" style="--d:.15s" role="img" aria-label="Aura No. 1 flacon"><div class="fl-in"><img src="aura-no1.webp" alt="" width="760" height="998" loading="lazy" decoding="async" draggable="false"></div></div>
     </div>
   </section>
 
@@ -1544,6 +1549,74 @@ const lean = (() => {
   return { tick };
 })();
 
+/* ───────── Aura No. 1 — the flacon turns once as it arrives ─────────
+   96 keyed frames in rot/ are painted on a canvas over the still photo (which stays as the fallback).
+   The spin runs while the bottle travels up to the middle of the screen, then it rests facing you.
+   Frames are fetched as blobs and decoded off the main thread in a small window around the current one. */
+const spin = (() => {
+  const box = $('.flacon'), host = box && $('.fl-in', box);
+  if (!box || !host || reduce || !('IntersectionObserver' in window) || typeof createImageBitmap !== 'function' || !window.fetch) return null;
+  if (navigator.connection && navigator.connection.saveData) return null;
+  const NF = 96, FW = 540, FH = 960, R = 10;
+  const cv = document.createElement('canvas'); cv.width = FW; cv.height = FH; cv.setAttribute('aria-hidden', 'true');
+  const cx = cv.getContext('2d', { alpha: false });
+  if (!cx) return null;
+  host.appendChild(cv);
+  const bl = new Array(NF), bm = new Array(NF), pend = new Set();
+  let n = 0, wnt = -1, ctr = 0, last = null, cur = 0, top = 0, hh = 1, vh = innerHeight, lastSH = 0, ready = false, shownCls = false, go = false, k = 0;
+  const ord = [], seen = new Set();
+  const add = i => { if (!seen.has(i)) { seen.add(i); ord.push(i); } };
+  add(0); add(NF - 1);
+  [8, 4, 2, 1].forEach(s => { for (let i = 0; i < NF; i += s) add(i); });   /* coarse first, then fill in */
+  const absTop = el => { let y = 0; for (let e = el; e; e = e.offsetParent) y += e.offsetTop; return y; };
+  const meas = () => { top = absTop(box); hh = box.offsetHeight || 1; vh = innerHeight; lastSH = document.documentElement.scrollHeight; };
+  const target = y => sstep(.06, .5, (y + vh - top) / (vh + hh));
+  /* decode the frames around c; drop the ones far away so memory stays small */
+  const warm = c => {
+    ctr = c;
+    for (let d = 0; d <= R; d++) [c + d, c - d].forEach(i => {
+      if (i < 0 || i >= NF || bm[i] || pend.has(i) || !bl[i]) return;
+      pend.add(i);
+      createImageBitmap(bl[i]).then(b => { pend.delete(i); if (Math.abs(i - ctr) > R + 4) b.close(); else bm[i] = b; }, () => pend.delete(i));
+    });
+    for (let i = 0; i < NF; i++) if (bm[i] && Math.abs(i - c) > R + 4) { bm[i].close(); bm[i] = null; }
+  };
+  const pick = w => {
+    if (bm[w]) return bm[w];
+    for (let d = 1; d < NF; d++) { if (w - d >= 0 && bm[w - d]) return bm[w - d]; if (w + d < NF && bm[w + d]) return bm[w + d]; }
+    return null;
+  };
+  const paint = () => {
+    const w = Math.round(cur * (NF - 1));
+    if (w !== wnt) { wnt = w; warm(w); }
+    const s = pick(w);
+    if (!s || s === last) return;
+    last = s; cx.drawImage(s, 0, 0);
+    if (!shownCls) { shownCls = true; box.classList.add('spin'); }
+  };
+  const pull = () => {
+    if (k >= ord.length) return;
+    const i = ord[k++];
+    fetch('rot/r' + String(i + 1).padStart(3, '0') + '.webp')
+      .then(r => r.ok ? r.blob() : Promise.reject())
+      .then(b => { bl[i] = b; n++; wnt = -1; if (!ready && n >= 26) { ready = true; meas(); cur = target(scrollY); } pull(); }, pull);
+  };
+  const start = () => { if (go) return; go = true; for (let w = 0; w < 4; w++) pull(); };
+  meas();
+  addEventListener('resize', meas); addEventListener('load', meas);
+  new IntersectionObserver((es, io) => { if (es.some(e => e.isIntersecting)) { io.disconnect(); start(); } }, { rootMargin: '1800px 0px' }).observe(box);
+  function tick(dt, y) {
+    if (!ready) return;
+    if (document.documentElement.scrollHeight !== lastSH) meas();
+    const t = (y + vh - top) / (vh + hh);          /* 0: bottle enters at the bottom of the screen, 1: it has left at the top */
+    if (t < -.15 || t > 1.15) { cur = t > 1 ? 1 : 0; if (!shownCls) paint(); return; }
+    const tg = target(y);
+    cur = Math.abs(tg - cur) < 5e-4 ? tg : cur + (tg - cur) * (1 - Math.exp(-dt * 10));
+    paint();
+  }
+  return { tick };
+})();
+
 /* ───────── main loop ───────── */
 let ps = 0, lastT = performance.now();
 function frame(now) {
@@ -1554,6 +1627,7 @@ function frame(now) {
   stageUI(ps, y);
   cursorTick(dt); mistTick(dt);
   if (lean) lean.tick(dt);
+  if (spin) spin.tick(dt, y);
   if (document.documentElement.scrollHeight !== lastH) { measure(); updateLG(); }
   requestAnimationFrame(frame);
 }
